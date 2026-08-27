@@ -18,9 +18,7 @@ This module provides a pure-Python (no pandas/numpy) end-to-end data pipeline:
 """
 
 import csv
-import json
 from pathlib import Path
-import random
 import sys
 import requests
 
