@@ -1,202 +1,321 @@
+#!/usr/bin/env python3
 """
-Project Sentinel: Automated Near-Earth Object (NEO) Clean Pipeline.
+src/pipeline.py — Project Sentinel: Automated Near-Earth Object Triage Pipeline.
 
-This pipeline executes direct data processing on clean NASA NeoWs API feeds:
-1. Fetches close-approach data from NASA's NeoWs API.
-2. Cleans, imputes, and parses raw NEO fields directly.
-3. Engineers critical risk features (e.g., lunar miss distance, priority watch flag).
-4. Scales normalized features using Min-Max scaling.
-5. Saves the processed clean dataset to 'data/processed/clean_data.csv'.
+Author: Khairy Mohammed (Data Engineering Intern @ IBM)
+Reviewer: Lead Data Engineer @ IBM
+
+This module provides a pure-Python (no pandas/numpy) end-to-end data pipeline:
+ 1. Scrapes total cataloged NEOs count from NASA Planetary Defense page.
+ 2. Fetches 14 days of live NEO close-approach data from NASA NeoWs API (chained requests).
+ 3. Extracts unique IDs and triggers synthetic ground-station log generation.
+ 4. Cleans, imputes missing values (median absolute magnitude), and filters empty cohorts.
+ 5. Performs feature engineering (size_to_distance_ratio, approach_category, priority_watch).
+ 6. Joins with dirty ground station logs using safe lookup mechanisms.
+ 7. Performs Min-Max scaling on size_to_distance_ratio.
+ 8. Computes validation crosstab against NASA's hazardous flag.
+ 9. Exports the final cleaned dataset to data/processed/clean_data.csv.
 """
 
 import csv
+import json
 from pathlib import Path
+import random
+import sys
 import requests
-import os 
 
 
-# Constants & Configuration
-API_KEY = os.getenv("NASA_API_KEY", "DEMO_KEY")
-BASE_URL = "https://api.nasa.gov/neo/rest/v1/feed"
-PROCESSED_DATA_DIR = Path("data/processed")
-OUTPUT_FILE_PATH = PROCESSED_DATA_DIR / "clean_data.csv"
+try:
+    from generate_sentinel_log import generate_sentinel_log
+except ImportError:
+    # Fallback if imported from inside src/
+    sys.path.append(str(Path(__file__).resolve().parent.parent))
+    from generate_sentinel_log import generate_sentinel_log
 
-# Date ranges (6 weekly windows)
-DATE_WINDOWS = [
-    ("2026-08-01", "2026-08-08"),
-    ("2026-08-08", "2026-08-14"),
-    ("2026-08-15", "2026-08-21"),
-    ("2026-07-15", "2026-07-21"),
-    ("2026-07-08", "2026-07-14"),
-    ("2026-07-01", "2026-07-07"),
-]
+# Directories setup
+BASE_DIR = Path(__file__).resolve().parent.parent
+DATA_RAW_DIR = BASE_DIR / "data" / "raw"
+DATA_PROCESSED_DIR = BASE_DIR / "data" / "processed"
 
-
-def fetch_nasa_neo_data(
-    api_key: str = API_KEY, date_windows: list = DATE_WINDOWS
-) -> list:
-    """Fetches near-earth objects data directly from NASA's NeoWs feed API."""
-    all_asteroids = []
-    print("🌐 Initiating NASA NeoWs API calls...")
-
-    for start_date, end_date in date_windows:
-        params = {
-            "start_date": start_date,
-            "end_date": end_date,
-            "api_key": api_key,
-        }
-        try:
-            response = requests.get(BASE_URL, params=params, timeout=15)
-            response.raise_for_status()
-            data = response.json()
-
-            for _, asteroids in data.get("near_earth_objects", {}).items():
-                all_asteroids.extend(asteroids)
-
-        except requests.exceptions.RequestException as e:
-            print(f"⚠️ Warning: Request failed for window {start_date} to {end_date}: {e}")
-
-    print(f"✅ Successfully fetched {len(all_asteroids)} raw asteroid records.")
-    return all_asteroids
+EXTRACTED_IDS_PATH = DATA_RAW_DIR / "extracted_ids.txt"
+LOG_CSV_PATH = DATA_RAW_DIR / "ground_station_log.csv"
+CLEAN_CSV_PATH = DATA_PROCESSED_DIR / "clean_data.csv"
 
 
-def process_clean_data(raw_asteroids: list) -> list:
-    """Parses clean API data, engineers target/risk features, and applies Min-Max scaling."""
+# ==========================================
+# Helper Functions
+# ==========================================
+
+def safe_float(value, default=None):
+    """Safely cast string/numeric values to float, handling dirty entries."""
+    if value is None:
+        return default
+    if isinstance(value, (int, float)):
+        return float(value)
     
-    # Deduplicate raw asteroids by ID
-    unique_asteroids = {}
-    for ast in raw_asteroids:
-        ast_id = str(ast.get("id", "")).strip()
-        if ast_id and ast_id not in unique_asteroids:
-            unique_asteroids[ast_id] = ast
+    val_str = str(value).strip()
+    if not val_str or val_str.upper() in ["N/A", "NULL", "NONE", "UNKNOWN"]:
+        return default
+    try:
+        return float(val_str)
+    except ValueError:
+        return default
 
-    # Imputation fallback: Calculate median for missing absolute magnitude
-    magnitudes = [
-        float(ast["absolute_magnitude_h"])
-        for ast in unique_asteroids.values()
-        if ast.get("absolute_magnitude_h") is not None
+
+def compute_median(values):
+    """Computes median using pure Python native sorting."""
+    if not values:
+        return 0.0
+    sorted_vals = sorted(values)
+    n = len(sorted_vals)
+    return sorted_vals[n // 2]
+
+
+# ==========================================
+# Phase 1: Web Scraping & API Data Acquisition
+# ==========================================
+
+def scrape_total_known_neos() -> int:
+    """Scrapes total cataloged NEO count from NASA Planetary Defense page."""
+    url = "https://science.nasa.gov/science-research/planetary-science/planetary-defense/near-earth-asteroids/"
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+    anchor_phrase = "Total number of discovered near-Earth asteroids"
+    
+    try:
+        response = requests.get(url, headers=headers, timeout=10)
+        response.raise_for_status()
+        html_text = response.text
+        
+        if anchor_phrase in html_text:
+            idx = html_text.index(anchor_phrase)
+            # Take a 50-character window prior to the anchor
+            snippet = html_text[max(0, idx - 50):idx]
+            colon_idx = snippet.rfind(":")
+            if colon_idx != -1:
+                number_str = snippet[:colon_idx].strip().split()[-1].replace(",", "")
+                val = int(number_str)
+                print(f"[Web Scrape] Successfully extracted total_known_neos: {val:,}")
+                return val
+    except Exception as e:
+        print(f"[Web Scrape Warning] Could not extract live count ({e}). Using fallback baseline.")
+    
+    fallback_val = 35000
+    print(f"[Web Scrape] Using default fallback: {fallback_val:,}")
+    return fallback_val
+
+
+def fetch_nasa_neows_data(api_key: str = "DEMO_KEY") -> list:
+    """Fetches 14 days of NEO data using 2 chained 7-day windows."""
+    base_url = "https://api.nasa.gov/neo/rest/v1/feed"
+    # NASA API limit: max 7 days per call -> Chain 2 calls (14 days total)
+    date_windows = [
+        ("2026-08-01", "2026-08-07"),
+        ("2026-08-08", "2026-08-14")
     ]
-    magnitudes.sort()
-    median_magnitude = magnitudes[len(magnitudes) // 2] if magnitudes else 0.0
-
-    clean_master_records = []
-
-    for neo_id, nasa_info in unique_asteroids.items():
-        approaches = nasa_info.get("close_approach_data", [])
-        if not approaches:
-            continue
-
-        first_app = approaches[0]
-        approach_date = first_app.get("close_approach_date")
-
-        try:
-            speed = float(
-                first_app.get("relative_velocity", {}).get("kilometers_per_hour", 0)
-            )
-        except (ValueError, TypeError):
-            speed = 0.0
-
-        try:
-            miss_dist = float(
-                first_app.get("miss_distance", {}).get("kilometers", 0)
-            )
-        except (ValueError, TypeError):
-            miss_dist = 0.0
-
-        diameter_info = (
-            nasa_info.get("estimated_diameter", {}).get("kilometers", {})
-        )
-        min_d = float(diameter_info.get("estimated_diameter_min", 0.0))
-        max_d = float(diameter_info.get("estimated_diameter_max", 0.0))
-        avg_d = (min_d + max_d) / 2.0
-
-        abs_mag = nasa_info.get("absolute_magnitude_h")
-        try:
-            abs_mag = float(abs_mag) if abs_mag is not None else median_magnitude
-        except (ValueError, TypeError):
-            abs_mag = median_magnitude
-
-        # Feature Engineering
-        miss_distance_lunar = miss_dist / 384400.0 if miss_dist > 0 else 0.0
-        priority_watch = 1 if (max_d >= 0.14 and miss_distance_lunar <= 10) else 0
-        size_to_dist_ratio = (max_d / miss_distance_lunar) if miss_distance_lunar > 0 else 0.0
-
-        if miss_distance_lunar <= 5:
-            approach_category = "very_close"
-        elif miss_distance_lunar <= 20:
-            approach_category = "close"
-        elif miss_distance_lunar <= 60:
-            approach_category = "moderate"
-        else:
-            approach_category = "distant"
-
-        record = {
-            "asteroid_id": neo_id,
-            "name": nasa_info.get("name"),
-            "is_hazardous": nasa_info.get("is_potentially_hazardous_asteroid", False),
-            "absolute_magnitude_h": round(abs_mag, 2),
-            "estimated_diameter_min_km": round(min_d, 4),
-            "estimated_diameter_max_km": round(max_d, 4),
-            "avg_diameter_km": round(avg_d, 4),
-            "close_approach_date": approach_date,
-            "close_approach_speed_kph": round(speed, 2),
-            "miss_distance_km": round(miss_dist, 2),
-            "miss_distance_lunar": round(miss_distance_lunar, 4),
-            "size_to_distance_ratio": size_to_dist_ratio,
-            "approach_category": approach_category,
-            "priority_watch": priority_watch,
+    
+    all_records = []
+    print("[API] Starting NASA NeoWs data acquisition...")
+    
+    for start_d, end_d in date_windows:
+        params = {
+            "start_date": start_d,
+            "end_date": end_d,
+            "api_key": api_key
         }
-        clean_master_records.append(record)
+        try:
+            res = requests.get(base_url, params=params, timeout=15)
+            res.raise_for_status()
+            data = res.json()
+            
+            # near_earth_objects is a dict keyed by date string
+            neo_dict = data.get("near_earth_objects", {})
+            window_count = 0
+            for date_str, items in neo_dict.items():
+                for item in items:
+                    all_records.append(item)
+                    window_count += 1
+            print(f"[API] Fetched {window_count} records for window {start_d} -> {end_d}")
+            
+        except requests.exceptions.RequestException as err:
+            print(f"[API Error] Network request failed for range {start_d} to {end_d}: {err}")
+            raise
+            
+    print(f"[API] Total raw records retrieved: {len(all_records)}")
+    return all_records
 
-    # Min-Max Scaling for size_to_distance_ratio
-    if clean_master_records:
-        ratios = [rec["size_to_distance_ratio"] for rec in clean_master_records]
-        min_r, max_r = min(ratios), max(ratios)
 
-        for rec in clean_master_records:
-            scaled = (
-                (rec["size_to_distance_ratio"] - min_r) / (max_r - min_r)
-                if max_r != min_r
-                else 0.0
-            )
-            rec["scaled_size_to_distance_ratio"] = round(scaled, 6)
-            rec["size_to_distance_ratio"] = round(rec["size_to_distance_ratio"], 6)
+# ==========================================
+# Phase 2 & 3: Data Processing & Pipeline
+# ==========================================
 
-    return clean_master_records
+def run_pipeline(api_key: str = "DEMO_KEY"):
+    """Executes the full end-to-end Project Sentinel data pipeline."""
+    DATA_RAW_DIR.mkdir(parents=True, exist_ok=True)
+    DATA_PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
+    
+
+    total_known_neos = scrape_total_known_neos()
+
+    
+    raw_records = fetch_nasa_neows_data(api_key=api_key)
+    
+
+    extracted_ids = [str(r["neo_reference_id"]) for r in raw_records if "neo_reference_id" in r]
+
+    unique_ids = list(dict.fromkeys(extracted_ids))
+    EXTRACTED_IDS_PATH.write_text("\n".join(unique_ids), encoding="utf-8")
+    print(f"[Log Step] Extracted {len(unique_ids)} unique IDs to {EXTRACTED_IDS_PATH}")
+    
+
+    generate_sentinel_log(unique_ids, output_path=LOG_CSV_PATH, seed=42)
+    
+
+    filtered_records = []
+    valid_abs_mags = []
+    
+    for r in raw_records:
+        ca_data = r.get("close_approach_data", [])
+
+        if not ca_data:
+            continue
+            
+        ca = ca_data[0] 
 
 
-def run_pipeline() -> None:
-    """Executes the clean Project Sentinel Data Pipeline."""
-    print("🚀 Starting Clean Project Sentinel Data Pipeline...\n")
+        diam_km_max = safe_float(r.get("estimated_diameter", {}).get("kilometers", {}).get("estimated_diameter_max"))
+        diam_km_min = safe_float(r.get("estimated_diameter", {}).get("kilometers", {}).get("estimated_diameter_min"))
+        
+        miss_km = safe_float(ca.get("miss_distance", {}).get("kilometers"))
+        miss_lunar = safe_float(ca.get("miss_distance", {}).get("lunar"))
+        rel_vel_kph = safe_float(ca.get("relative_velocity", {}).get("kilometers_per_hour"))
+        
+        abs_mag = safe_float(r.get("absolute_magnitude_h"))
+        if abs_mag is not None:
+            valid_abs_mags.append(abs_mag)
+            
+        is_pha = bool(r.get("is_potentially_hazardous_asteroid", False))
+        neo_id = str(r.get("neo_reference_id", "")).strip()
+        name = str(r.get("name", "")).strip()
+        
+        filtered_records.append({
+            "neo_id": neo_id,
+            "name": name,
+            "max_diameter_km": diam_km_max,
+            "min_diameter_km": diam_km_min,
+            "miss_distance_km": miss_km,
+            "miss_distance_lunar": miss_lunar,
+            "relative_velocity_kph": rel_vel_kph,
+            "absolute_magnitude_h": abs_mag,
+            "is_potentially_hazardous_asteroid": is_pha,
+            "num_close_approaches": len(ca_data),
+            "total_known_neos": total_known_neos
+        })
+        
+    print(f"[Cohort Filter] Retained {len(filtered_records)} / {len(raw_records)} records.")
+    
 
-    raw_asteroids = fetch_nasa_neo_data()
+    cohort_median_mag = compute_median(valid_abs_mags)
+    for rec in filtered_records:
+        if rec["absolute_magnitude_h"] is None:
+            rec["absolute_magnitude_h"] = cohort_median_mag
 
-    if not raw_asteroids:
-        print("❌ Error: No raw records were fetched. Pipeline aborted.")
-        return
 
-    cleaned_records = process_clean_data(raw_asteroids)
+    for rec in filtered_records:
+        d_max = rec["max_diameter_km"] if rec["max_diameter_km"] is not None else 0.0
+        dist_lunar = rec["miss_distance_lunar"] if rec["miss_distance_lunar"] is not None else 9999.0
+        
 
-    PROCESSED_DATA_DIR.mkdir(parents=True, exist_ok=True)
-    fieldnames = list(cleaned_records[0].keys())
+        rec["size_to_distance_ratio"] = d_max / dist_lunar if dist_lunar > 0 else 0.0
+        
 
-    with open(OUTPUT_FILE_PATH, mode="w", newline="", encoding="utf-8") as f:
+        if dist_lunar <= 5.0:
+            rec["approach_category"] = "very_close"
+        elif dist_lunar <= 20.0:
+            rec["approach_category"] = "close"
+        elif dist_lunar <= 60.0:
+            rec["approach_category"] = "moderate"
+        else:
+            rec["approach_category"] = "distant"
+
+
+        if d_max >= 0.14 and dist_lunar <= 10.0:
+            rec["priority_watch"] = 1
+        else:
+            rec["priority_watch"] = 0
+
+    log_map = {}
+    if LOG_CSV_PATH.exists():
+        with LOG_CSV_PATH.open("r", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                nid = str(row.get("neo_id", "")).strip()
+                obs = str(row.get("observatory_code", "")).strip()
+                score = safe_float(row.get("confidence_score"))
+                log_map[nid] = {
+                    "observatory_code": obs if obs else "UNKNOWN",
+                    "confidence_score": score
+                }
+
+    for rec in filtered_records:
+        log_entry = log_map.get(rec["neo_id"], {})
+        rec["observatory_code"] = log_entry.get("observatory_code", "UNMATCHED")
+        rec["confidence_score"] = log_entry.get("confidence_score", None)
+
+
+    ratios = [r["size_to_distance_ratio"] for r in filtered_records]
+    min_x = min(ratios) if ratios else 0.0
+    max_x = max(ratios) if ratios else 1.0
+    range_x = max_x - min_x
+    
+    for rec in filtered_records:
+        if range_x > 0:
+            rec["scaled_size_to_distance_ratio"] = round((rec["size_to_distance_ratio"] - min_x) / range_x, 6)
+        else:
+            rec["scaled_size_to_distance_ratio"] = 0.0
+
+
+    total_objs = len(filtered_records)
+    flagged_objs = sum(1 for r in filtered_records if r["priority_watch"] == 1)
+    workload_reduction = (1 - (flagged_objs / total_objs)) * 100 if total_objs > 0 else 0.0
+    
+    print("\n" + "="*50)
+    print("PIPELINE EXECUTION SUMMARY & METRICS")
+    print("="*50)
+    print(f"• Total Processed Cohort (n_total): {total_objs}")
+    print(f"• Priority Flagged (priority_watch=1): {flagged_objs}")
+    print(f"• Headline ROI Metric: Workload Cut by {workload_reduction:.2f}%")
+    
+    # 2x2 Crosstab
+    crosstab = {(True, 1): 0, (True, 0): 0, (False, 1): 0, (False, 0): 0}
+    for r in filtered_records:
+        pair = (r["is_potentially_hazardous_asteroid"], r["priority_watch"])
+        crosstab[pair] = crosstab.get(pair, 0) + 1
+        
+    print("\n[Validation Check: 2x2 Crosstab Matrix]")
+    print(f"  NASA Hazardous (True)  & Priority (1) : {crosstab[(True, 1)]}")
+    print(f"  NASA Hazardous (True)  & Routine  (0) : {crosstab[(True, 0)]}")
+    print(f"  NASA Normal    (False) & Priority (1) : {crosstab[(False, 1)]}")
+    print(f"  NASA Normal    (False) & Routine  (0) : {crosstab[(False, 0)]}")
+    print("="*50 + "\n")
+
+
+    fieldnames = [
+        "neo_id", "name", "max_diameter_km", "min_diameter_km", 
+        "miss_distance_km", "miss_distance_lunar", "relative_velocity_kph", 
+        "absolute_magnitude_h", "is_potentially_hazardous_asteroid", 
+        "num_close_approaches", "total_known_neos", "size_to_distance_ratio", 
+        "scaled_size_to_distance_ratio", "approach_category", "priority_watch", 
+        "observatory_code", "confidence_score"
+    ]
+    
+    with CLEAN_CSV_PATH.open("w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
-        writer.writerows(cleaned_records)
-
-    print(f"\n💾 Cleaned data saved successfully to: {OUTPUT_FILE_PATH}")
-    print(f"📊 Processed Records Count: {len(cleaned_records)}")
-
-    # Summary Metrics
-    n_total = len(cleaned_records)
-    n_flagged = sum(1 for r in cleaned_records if r["priority_watch"] == 1)
-    workload_reduction = (1 - (n_flagged / n_total)) * 100 if n_total > 0 else 0
-
-    print(f"🎯 Flagged Priority Objects: {n_flagged}")
-    print(f"📉 Workload Reduction Metric: {workload_reduction:.2f}%")
-    print("\n✅ Pipeline execution completed successfully!")
+        writer.writerows(filtered_records)
+        
+    print(f"[Output Success] Clean dataset saved to: {CLEAN_CSV_PATH}")
 
 
 if __name__ == "__main__":
-    run_pipeline()
+
+    run_pipeline(api_key="DEMO_KEY")
