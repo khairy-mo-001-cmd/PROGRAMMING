@@ -21,6 +21,7 @@ import csv
 from pathlib import Path
 import sys
 import requests
+from database import save_pipeline_results
 
 
 try:
@@ -282,7 +283,12 @@ def run_pipeline(api_key: str = "DEMO_KEY"):
     print(f"• Total Processed Cohort (n_total): {total_objs}")
     print(f"• Priority Flagged (priority_watch=1): {flagged_objs}")
     print(f"• Headline ROI Metric: Workload Cut by {workload_reduction:.2f}%")
-    
+    run_id, database_path = save_pipeline_results(
+        records=filtered_records,
+        raw_record_count=len(raw_records),
+    )
+
+    print(f"[Database] Run {run_id} saved to: {database_path}")
     # 2x2 Crosstab
     crosstab = {(True, 1): 0, (True, 0): 0, (False, 1): 0, (False, 0): 0}
     for r in filtered_records:
